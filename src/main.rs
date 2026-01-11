@@ -31,9 +31,14 @@ mod bmp180_async;
 
 // MQTT related imports
 use rust_mqtt::{
-    client::{client::MqttClient, client_config::ClientConfig},
-    packet::v5::reason_codes::ReasonCode,
-    utils::rng_generator::CountingRng,
+    buffer::AllocBuffer,
+    client::{
+        event::{Event, Puback, Pubrej},
+        options::{ConnectOptions, PublicationOptions},
+        Client as MqttClient,
+    },
+    config::{KeepAlive, SessionExpiryInterval},
+    types::{MqttString, QoS, TopicName},
 };
 
 // Formatting related imports
@@ -127,6 +132,8 @@ async fn main(spawner: Spawner) -> ! {
         .with_scl(peripherals.GPIO2)
         .into_async();
 
+    let mut bmp = Bmp180::new(i2c0, sleep).await;
+
     let timg1 = TimerGroup::new(peripherals.TIMG1);
     esp_hal_embassy::init(timg1.timer0);
 
@@ -193,35 +200,40 @@ async fn main(spawner: Spawner) -> ! {
         }
         info!("connected!");
 
-        let mut config = ClientConfig::new(
-            rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-            CountingRng(20000),
-        );
-        config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
-        config.add_client_id("clientId-8rhWgBODCl");
-        config.max_packet_size = 100;
-        let mut recv_buffer = [0; 80];
-        let mut write_buffer = [0; 80];
+        let mut buffer = AllocBuffer;
 
-        let mut client =
-            MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
+        // MAX_SUBSCRIBES = 0, we don't subscribe to anything
+        // RECEIVE_MAXIMUM = 0, we don't receive any publications and certainly not QoS>0
+        // SEND_MAXIMUM = 1, we try to publish only 1 QoS=1 message at a time
+        let mut client: MqttClient<'_, _, _, 0, 0, 1> = MqttClient::new(&mut buffer);
 
-        match client.connect_to_broker().await {
-            Ok(()) => {}
-            Err(mqtt_error) => match mqtt_error {
-                ReasonCode::NetworkError => {
-                    error!("MQTT Network Error");
-                    continue;
-                }
-                _ => {
-                    error!("Other MQTT Error: {:?}", mqtt_error);
-                    continue;
-                }
-            },
+        let options = ConnectOptions {
+            // Because we don't have any ongoing publications inbetween connections,
+            // there is no need for a persistent session client-side.
+            clean_start: true,
+            keep_alive: KeepAlive::Infinite,
+            session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
+            user_name: None,
+            password: None,
+            will: None,
+        };
+        match client
+            .connect(
+                socket,
+                &options,
+                Some(MqttString::from_slice("clientId-8rhWgBODCl").unwrap()),
+            )
+            .await
+        {
+            Ok(_info) => {}
+            Err(e) => {
+                error!("Failed to connect to MQTT broker: {:?}", e);
+                client.abort().await;
+                continue;
+            }
         }
 
-        let mut bmp = Bmp180::new(i2c0, sleep).await;
-        loop {
+        'measure: loop {
             bmp.measure().await;
             let temperature = bmp.get_temperature();
             info!("Current temperature: {}", temperature);
@@ -230,27 +242,56 @@ async fn main(spawner: Spawner) -> ! {
             let mut temperature_string: String<32> = String::new();
             write!(temperature_string, "{:.2}", temperature).expect("write! failed!");
 
-            match client
-                .send_message(
-                    "temperature/1",
-                    temperature_string.as_bytes(),
-                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                    true,
-                )
+            let options = PublicationOptions {
+                retain: true,
+                // Safety: "temperature/1" has length < 65535
+                //         "temperature/1" is a well formed topic
+                topic: unsafe {
+                    TopicName::new_unchecked(MqttString::from_slice_unchecked("temperature/1"))
+                },
+                qos: QoS::AtLeastOnce,
+            };
+
+            let pid = match client
+                .publish(&options, temperature_string.as_bytes().into())
                 .await
             {
-                Ok(()) => {}
-                Err(mqtt_error) => match mqtt_error {
-                    ReasonCode::NetworkError => {
-                        error!("MQTT Network Error");
-                        continue;
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Failed to send publish: {:?}", e);
+                    // End connection and try again after reconnecting
+                    client.abort().await;
+                    break;
+                }
+            };
+
+            loop {
+                match client.poll().await {
+                    Ok(Event::PublishAcknowledged(Puback {
+                        packet_identifier,
+                        reason_code: _,
+                    })) if packet_identifier == pid => {
+                        // Successful publication, continue after 3 secs
+                        break;
                     }
-                    _ => {
-                        error!("Other MQTT Error: {:?}", mqtt_error);
-                        continue;
+                    Ok(Event::PublishRejected(Pubrej {
+                        packet_identifier,
+                        reason_code,
+                    })) if packet_identifier == pid => {
+                        error!("Broker rejected PUBLISH");
+                        // This publish flow is complete, we can retry a publish
+                        break;
                     }
-                },
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Failed to poll client: {:?}", e);
+                        // End connection and try again after reconnecting
+                        client.abort().await;
+                        break 'measure;
+                    }
+                }
             }
+
             Timer::after(Duration::from_millis(3000)).await;
         }
     }
